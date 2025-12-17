@@ -1,0 +1,3 @@
+[workspace]
+members = ["mini-dropbox-gui"]
+resolver = "3"
