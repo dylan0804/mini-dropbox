@@ -1,21 +1,24 @@
 use std::{ops::ControlFlow, path::PathBuf, sync::Arc};
 
-use anyhow::{anyhow, Result};
-use directories::ProjectDirs;
+use anyhow::anyhow;
 use eframe::CreationContext;
+use egui::{vec2, Align2, Vec2};
+use egui_toast::{Toast, ToastOptions, Toasts};
 use futures_util::{SinkExt, StreamExt};
+use names::{Generator, Name};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tokio::sync::oneshot::{self, Receiver, Sender};
+use rfd::FileDialog;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Bytes, Message},
+    tungstenite::{Bytes, Message, Utf8Bytes},
 };
 
-mod modals;
-mod requests;
-mod responses;
+use crate::{events::AppEvent, state::AppState};
+
+mod events;
+mod state;
+mod toast;
 
 #[tokio::main]
 async fn main() -> eframe::Result {
@@ -27,129 +30,141 @@ async fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "shit app",
+        "Mini Dropbox",
         native_options,
         Box::new(|cc| Ok(Box::new(MyApp::new(cc)))),
     )
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct PersistedState {
-    username: String,
-}
-
-#[derive(Default)]
 pub struct MyApp {
-    path: String,
+    app_state: AppState,
+    nickname: String,
     reqwest_client: Arc<Client>,
-    show_popup_username: bool,
-    username: String,
-    username_rx: Option<Receiver<Result<String>>>,
-    create_username_message: String,
-
-    should_open_username_modal: bool,
+    toasts: Toasts,
+    files: Vec<PathBuf>,
+    tx: Sender<AppEvent>,
+    rx: Receiver<AppEvent>,
 }
 
 impl MyApp {
-    fn new(cc: &CreationContext) -> Self {
-        let config_path = get_config_path();
-        let state = load_state(config_path);
+    fn new(_cc: &CreationContext) -> Self {
+        let (tx, rx) = mpsc::channel::<AppEvent>(100);
+
+        let toasts = Toasts::new()
+            .anchor(Align2::RIGHT_TOP, (-10., 10.))
+            .order(egui::Order::Tooltip);
 
         Self {
             reqwest_client: Arc::new(reqwest::Client::new()),
-            show_popup_username: true,
-            username_rx: None,
-            should_open_username_modal: true,
-            username: state.username,
-            ..Default::default()
+            app_state: AppState::OnStartup,
+            files: vec![],
+            nickname: "".into(),
+            toasts,
+            rx,
+            tx,
         }
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ctx.set_pixels_per_point(2.0);
+        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
+            ui.add_space(5.0);
 
-            self.poll_username_response();
+            ui.allocate_ui_with_layout(
+                ui.available_size(),
+                egui::Layout::right_to_left(egui::Align::LEFT),
+                |ui| {
+                    ui.label(&self.nickname);
+                },
+            );
 
-            self.show_username_modal(&ui);
-            if !self.path.is_empty() {
-                ui.label(self.path.clone());
-            }
-            ui.label(format!("Username is {}", self.username));
-            if ui.button("Test API").clicked() {
-                tokio::spawn(async move {
-                    let ws_stream = match connect_async("ws://127.0.0.1:3000/ws").await {
-                        Ok((stream, response)) => {
-                            println!("Server response was {response:?}");
-                            stream
-                        }
-                        Err(e) => {
-                            println!("Websocket handshake failed for client: {e}");
-                            return;
-                        }
-                    };
-
-                    let (mut sender, mut receiver) = ws_stream.split();
-
-                    tokio::spawn(async move {
-                        while let Some(Ok(msg)) = receiver.next().await {
-                            if process_message(msg).is_break() {
-                                break;
-                            }
-                        }
-                    });
-                });
-            }
+            ui.add_space(5.0);
         });
-    }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Err(e) = save_state(self.username.clone()) {
-            println!("Err saving state: {e}");
-            todo!("Display a modal");
-        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // error handler
+            while let Ok(app_event) = self.rx.try_recv() {
+                match app_event {
+                    AppEvent::WebSocketFailed(e) => {
+                        self.show_error_toast(e.to_string());
+                    }
+                    AppEvent::WebSocketSuccess => {
+                        self.app_state = AppState::Ready;
+                    }
+                }
+            }
+
+            match &self.app_state {
+                AppState::OnStartup => {
+                    let mut generator = Generator::with_naming(Name::Numbered);
+                    self.nickname = generator.next().unwrap_or("Guest".into());
+
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        let ws_stream = match connect_async("ws://127.0.0.1:3000/ws").await {
+                            Ok((stream, _)) => stream,
+                            Err(e) => {
+                                tx.send(AppEvent::WebSocketFailed(anyhow!(
+                                    "Websocket connection failed: {e}"
+                                )))
+                                .await
+                                .ok();
+                                return;
+                            }
+                        };
+
+                        let (mut sender, mut receiver) = ws_stream.split();
+
+                        tokio::spawn(async move {
+                            if let Some(Ok(msg)) = receiver.next().await {
+                                if process_message(msg).is_break() {
+                                    tx.send(AppEvent::WebSocketSuccess).await.ok();
+                                }
+                            }
+                        });
+                    });
+
+                    self.app_state = AppState::Connecting;
+                }
+                AppState::Connecting => {
+                    ui.centered_and_justified(|ui| {
+                        ui.add_space(ui.available_height() / 2.);
+                        ui.vertical_centered_justified(|ui| {
+                            ui.add(egui::Spinner::new().size(32.));
+                            ui.label("Connecting...");
+                        })
+                    });
+                }
+                AppState::Ready => {
+                    if ui.button("Select file").clicked() {
+                        let files = FileDialog::new().set_directory("/").pick_file().unwrap();
+                        self.files.push(files);
+                    }
+
+                    if !self.files.is_empty() {
+                        self.files.iter().for_each(|p| {
+                            ui.horizontal(|ui| {
+                                ui.label(p.file_name().unwrap().to_string_lossy());
+                                ui.button("Send to");
+                            });
+                        })
+                    }
+                }
+            }
+
+            self.toasts.show(ctx);
+        });
     }
 }
 
 fn process_message(msg: Message) -> ControlFlow<(), ()> {
     match msg {
-        Message::Ping(b) => {
-            println!("Got ping {:?}", b)
+        Message::Ping(_) => ControlFlow::Break(()),
+        Message::Text(b) => {
+            println!("{}", b.as_str());
+            ControlFlow::Continue(())
         }
-        _ => {}
+        _ => ControlFlow::Continue(()),
     }
-    ControlFlow::Continue(())
-}
-
-fn get_config_path() -> PathBuf {
-    let proj_dirs =
-        ProjectDirs::from("com", "lambs", "mini-dropbox").expect("cannot find project dir");
-    proj_dirs.config_dir().join("config.json")
-}
-
-fn load_state(path: PathBuf) -> PersistedState {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<PersistedState>(&s).ok())
-        .unwrap_or_default()
-}
-
-fn save_state(username: String) -> Result<()> {
-    // if fails, defaults to empty username
-    let persisted_state_json =
-        serde_json::to_string(&PersistedState { username }).unwrap_or_default();
-
-    let config_path = get_config_path();
-    std::fs::create_dir_all(
-        config_path
-            .parent()
-            .ok_or_else(|| anyhow!("Error creating config dir"))?,
-    )
-    .ok();
-
-    std::fs::write(config_path, persisted_state_json)?;
-
-    Ok(())
 }
