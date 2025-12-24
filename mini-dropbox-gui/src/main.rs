@@ -115,7 +115,8 @@ impl eframe::App for MyApp {
 
                     tokio::spawn(async move {
                         let ws_init = async {
-                            let ws_stream = match connect_async("ws://127.0.0.1:3000/ws").await {
+                            let ws_stream = match connect_async("ws://3.107.184.180:4001/ws").await
+                            {
                                 Ok((stream, _)) => stream,
                                 Err(e) => {
                                     return Err(e.to_string());
@@ -152,11 +153,15 @@ impl eframe::App for MyApp {
                                     });
 
                                     // send ws msg
+                                    let tx_clone = tx.clone();
                                     tokio::spawn(async move {
-                                        loop {
-                                            while let Ok(msg) = from_ui.try_recv() {
-                                                sender
-                                                    .send(Message::Text(Utf8Bytes::from(msg)))
+                                        while let Some(msg) = from_ui.recv().await {
+                                            if let Err(e) = sender
+                                                .send(Message::Text(Utf8Bytes::from(msg)))
+                                                .await
+                                            {
+                                                tx_clone
+                                                    .send(AppEvent::FatalError(e.to_string()))
                                                     .await
                                                     .ok();
                                             }
@@ -188,11 +193,13 @@ impl eframe::App for MyApp {
                         nickname: self.nickname.clone()
                     })
                     .to_string();
-                    self.to_ws.try_send(json).ok();
+                    if let Err(e) = self.to_ws.try_send(json) {
+                        self.tx.try_send(AppEvent::FatalError(e.to_string())).ok();
+                    }
 
                     self.app_state = AppState::WaitForRegisterConfirmation;
                 }
-                AppState::WaitForRegisterConfirmation => {}
+                AppState::WaitForRegisterConfirmation => {} // do nothing
                 AppState::Ready => {
                     if ui.button("Select file").clicked() {
                         let files = FileDialog::new().set_directory("/").pick_file().unwrap();
@@ -215,6 +222,15 @@ impl eframe::App for MyApp {
 
             self.toasts.show(ctx);
         });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Err(e) = self
+            .to_ws
+            .try_send(json!(WebSocketMessage::DisconnectUser(self.nickname.clone())).to_string())
+        {
+            self.tx.try_send(AppEvent::FatalError(e.to_string())).ok();
+        }
     }
 }
 

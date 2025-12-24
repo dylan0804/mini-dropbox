@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum WebSocketMessage {
     Register { nickname: String },
+    DisconnectUser(String),
 
     RegisterSuccess,
 
