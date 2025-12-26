@@ -1,15 +1,15 @@
 use std::{clone, ops::ControlFlow, path::PathBuf, sync::Arc};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use eframe::CreationContext;
 use egui::{vec2, Align2, Vec2};
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 use futures_util::{SinkExt, StreamExt};
+use iroh_blobs::ticket::BlobTicket;
 use names::{Generator, Name};
-use reqwest::Client;
 use rfd::FileDialog;
 use serde_json::json;
-use tokio::sync::mpsc::{self, error::TrySendError, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Bytes, Message, Utf8Bytes},
@@ -42,17 +42,19 @@ async fn main() -> eframe::Result {
 pub struct MyApp {
     app_state: AppState,
     nickname: String,
+    active_users_list: Vec<String>,
     toasts: Toasts,
     files: Vec<PathBuf>,
+    selected_file: PathBuf,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
-    to_ws: Sender<String>,
+    to_ws: Sender<WebSocketMessage>,
 }
 
 impl MyApp {
     fn new(_cc: &CreationContext) -> Self {
         let (tx, rx) = mpsc::channel::<AppEvent>(100);
-        let (to_ws, from_ui) = mpsc::channel::<String>(100);
+        let (to_ws, from_ui) = mpsc::channel::<WebSocketMessage>(100);
 
         let toasts = Toasts::new()
             .anchor(Align2::RIGHT_TOP, (-10., 10.))
@@ -61,6 +63,8 @@ impl MyApp {
         Self {
             app_state: AppState::OnStartup(Some(from_ui)),
             files: vec![],
+            selected_file: PathBuf::new(),
+            active_users_list: vec![],
             nickname: "".into(),
             to_ws,
             toasts,
@@ -96,8 +100,11 @@ impl eframe::App for MyApp {
                         self.show_toast("Register success!", ToastKind::Success);
                         self.app_state = AppState::Ready;
                     }
+                    AppEvent::UpdateActiveUsersList(active_users_list) => {
+                        self.active_users_list = active_users_list;
+                    }
                     AppEvent::FatalError(e) => {
-                        self.show_toast(e, ToastKind::Error);
+                        self.show_toast(format!("{e:#}"), ToastKind::Error);
                     }
                 }
             }
@@ -115,23 +122,18 @@ impl eframe::App for MyApp {
 
                     tokio::spawn(async move {
                         let ws_init = async {
-                            let ws_stream = match connect_async("ws://3.107.184.180:4001/ws").await
-                            {
-                                Ok((stream, _)) => stream,
-                                Err(e) => {
-                                    return Err(e.to_string());
-                                }
-                            };
+                            let ws_stream = connect_async("ws://3.107.184.180:4001/ws")
+                                .await
+                                .context("WebSocket connection failed")?;
 
-                            let (sender, receiver) = ws_stream.split();
-                            Ok((sender, receiver))
+                            let (sender, receiver) = ws_stream.0.split();
+                            Ok::<_, anyhow::Error>((sender, receiver))
                         };
 
                         let iroh_init = async {
-                            match IrohNode::new().await {
-                                Ok(iroh_node) => Ok(iroh_node),
-                                Err(e) => Err(e.to_string()),
-                            }
+                            IrohNode::new()
+                                .await
+                                .context("Iroh node initialization failed")
                         };
 
                         tokio::spawn(async move {
@@ -155,15 +157,52 @@ impl eframe::App for MyApp {
                                     // send ws msg
                                     let tx_clone = tx.clone();
                                     tokio::spawn(async move {
-                                        while let Some(msg) = from_ui.recv().await {
-                                            if let Err(e) = sender
-                                                .send(Message::Text(Utf8Bytes::from(msg)))
-                                                .await
-                                            {
-                                                tx_clone
-                                                    .send(AppEvent::FatalError(e.to_string()))
-                                                    .await
-                                                    .ok();
+                                        while let Some(websocket_msg) = from_ui.recv().await {
+                                            match websocket_msg {
+                                                WebSocketMessage::PrepareFile(abs_path) => {
+                                                    let tag = iroh_node
+                                                        .store
+                                                        .blobs()
+                                                        .add_path(abs_path)
+                                                        .await
+                                                        .unwrap();
+
+                                                    let node_id = iroh_node.endpoint.id();
+
+                                                    let ticket = BlobTicket::new(
+                                                        node_id.into(),
+                                                        tag.hash,
+                                                        tag.format,
+                                                    )
+                                                    .to_string();
+
+                                                    let json = WebSocketMessage::SendFile(ticket)
+                                                        .to_json();
+
+                                                    if let Err(e) = sender
+                                                        .send(Message::Text(json.into()))
+                                                        .await
+                                                        .context("Websocket send failed")
+                                                    {
+                                                        tx_clone
+                                                            .send(AppEvent::FatalError(e))
+                                                            .await
+                                                            .ok();
+                                                    }
+                                                }
+                                                _ => {
+                                                    let json = websocket_msg.to_json();
+                                                    if let Err(e) = sender
+                                                        .send(Message::Text(json.into()))
+                                                        .await
+                                                        .context("Websocket send failed")
+                                                    {
+                                                        tx_clone
+                                                            .send(AppEvent::FatalError(e))
+                                                            .await
+                                                            .ok();
+                                                    }
+                                                }
                                             }
                                         }
                                     });
@@ -189,14 +228,15 @@ impl eframe::App for MyApp {
                     });
                 }
                 AppState::PublishUser => {
-                    let json = json!(WebSocketMessage::Register {
-                        nickname: self.nickname.clone()
-                    })
-                    .to_string();
-                    if let Err(e) = self.to_ws.try_send(json) {
-                        self.tx.try_send(AppEvent::FatalError(e.to_string())).ok();
+                    if let Err(e) = self.to_ws.try_send(WebSocketMessage::Register {
+                        nickname: self.nickname.clone(),
+                    }) {
+                        self.tx
+                            .try_send(AppEvent::FatalError(
+                                anyhow!(e).context("Register send failed"),
+                            ))
+                            .ok();
                     }
-
                     self.app_state = AppState::WaitForRegisterConfirmation;
                 }
                 AppState::WaitForRegisterConfirmation => {} // do nothing
@@ -211,10 +251,57 @@ impl eframe::App for MyApp {
                             ui.horizontal(|ui| {
                                 ui.label(p.file_name().unwrap().to_string_lossy());
                                 if ui.button("Send to").clicked() {
-                                    self.to_ws.try_send("Bitch".into()).ok();
+                                    self.selected_file = p.clone();
+                                    if let Err(e) = self.to_ws.try_send(
+                                        WebSocketMessage::GetActiveUsersList(self.nickname.clone()),
+                                    ) {
+                                        self.tx
+                                            .try_send(AppEvent::FatalError(anyhow!(e).context(
+                                                "Failed to send WebSocket message to pipe",
+                                            )))
+                                            .ok();
+                                    }
                                 }
                             });
                         })
+                    }
+
+                    if !self.selected_file.to_string_lossy().to_string().is_empty() {
+                        println!("sending file");
+                        let abs_path = std::path::absolute(&self.selected_file).unwrap();
+
+                        if let Err(e) = self.to_ws.try_send(WebSocketMessage::PrepareFile(abs_path))
+                        {
+                            self.tx
+                                .try_send(AppEvent::FatalError(
+                                    anyhow!(e).context("failed to send websocket msg"),
+                                ))
+                                .ok();
+                        }
+                        self.selected_file = PathBuf::new();
+                    }
+
+                    if !self.active_users_list.is_empty() {
+                        self.active_users_list.iter().for_each(|u| {
+                            if ui.button(u).clicked() {
+                                // get iroh credentials (blob and endpoint)
+                                // send name and iroh credentials through websocket
+                                // websocket finds the name and get the sender for that name
+                                // send the blob and endpoint from the client
+                                // download
+
+                                let abs_path = std::path::absolute(&self.selected_file).unwrap();
+                                if let Err(e) =
+                                    self.to_ws.try_send(WebSocketMessage::PrepareFile(abs_path))
+                                {
+                                    self.tx
+                                        .try_send(AppEvent::FatalError(
+                                            anyhow!(e).context("failed to send websocket msg"),
+                                        ))
+                                        .ok();
+                                }
+                            }
+                        });
                     }
                 }
                 _ => {}
@@ -227,9 +314,13 @@ impl eframe::App for MyApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Err(e) = self
             .to_ws
-            .try_send(json!(WebSocketMessage::DisconnectUser(self.nickname.clone())).to_string())
+            .try_send(WebSocketMessage::DisconnectUser(self.nickname.clone()))
         {
-            self.tx.try_send(AppEvent::FatalError(e.to_string())).ok();
+            self.tx
+                .try_send(AppEvent::FatalError(
+                    anyhow!(e).context("Disconnect send failed"),
+                ))
+                .ok();
         }
     }
 }
@@ -242,15 +333,32 @@ async fn process_message(msg: Message, tx: Sender<AppEvent>) -> ControlFlow<(), 
                     tx.send(AppEvent::RegisterSuccess).await.ok();
                 }
                 WebSocketMessage::ErrorDeserializingJson(e) => {
-                    tx.send(AppEvent::FatalError(e.to_string())).await.ok();
+                    tx.send(AppEvent::FatalError(
+                        anyhow!(e).context("Server JSON error"),
+                    ))
+                    .await
+                    .ok();
+                }
+                WebSocketMessage::ActiveUsersList(active_users_list) => {
+                    tx.send(AppEvent::UpdateActiveUsersList(active_users_list))
+                        .await
+                        .ok();
+                }
+                WebSocketMessage::ReceiveFile(ticket) => {
+                    println!("ticket is {ticket}");
                 }
                 _ => {}
             },
             Err(e) => {
-                tx.send(AppEvent::FatalError(e.to_string())).await.ok();
+                tx.send(AppEvent::FatalError(
+                    anyhow!(e).context("Message parse failed"),
+                ))
+                .await
+                .ok();
             }
         },
         _ => {}
     }
+
     ControlFlow::Continue(())
 }

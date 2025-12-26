@@ -3,5 +3,7 @@ pub enum AppEvent {
     AllSystemsGo,
     RegisterSuccess,
 
-    FatalError(String),
+    UpdateActiveUsersList(Vec<String>),
+
+    FatalError(anyhow::Error),
 }
